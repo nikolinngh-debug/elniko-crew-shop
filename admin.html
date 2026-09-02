@@ -1,0 +1,841 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <!-- Prevent theme flash: Apply stored theme immediately before page renders -->
+    <script>
+      (function () {
+        try {
+          var theme = localStorage.getItem("emergent-theme");
+          if (!theme) {
+            var isLoggedIn = Object.keys(localStorage).some(function (k) {
+              return k.startsWith("sb-") && k.endsWith("-auth-token");
+            });
+            theme = isLoggedIn ? "dark" : "system";
+          }
+          if (theme === "light" || (theme === "system" && window.matchMedia("(prefers-color-scheme: light)").matches)) {
+            document.documentElement.classList.remove("dark");
+            document.documentElement.classList.add("light");
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <!-- Tracking allowlist — gates GTM/VWO/Rewardful/PartnerStack/Meta/TikTok Pixel to prod hosts only.
+         (For PartnerStack — an essential-category script — this host gate is the ONLY gate.)
+         Prevents third-party tracking scripts from firing on preview/CDN hosts (e.g. *.preview.emergentagent.com)
+         where our bundle is served as a wake-up page, which would attribute pixel events to user-preview domains. -->
+    <script>
+      (function () {
+        var ALLOWED_TRACKING_HOSTS = ["app.emergent.sh", "dev.emergentagent.com"];
+        window.__emergentTrackingAllowed = ALLOWED_TRACKING_HOSTS.indexOf(window.location.hostname) !== -1;
+        var h = window.location.hostname;
+        // Exact or subdomain suffix match, not substring: a bare indexOf lets a crafted hostname
+        // (e.g. getwingman.sh.attacker.com) satisfy the wingman consent/host gate.
+        window.__wingmanTrackingAllowed =
+          h === "getwingman.sh" ||
+          h.endsWith(".getwingman.sh") ||
+          h === "getwingman.com" ||
+          h.endsWith(".getwingman.com");
+      })();
+    </script>
+    <!-- GDPR consent gate — synchronous, must run right after the host allowlist above and BEFORE
+         every GTM/gtag/pixel block below. Reads the edge verdict cookie (emergent_geo_consent:
+         "1" = consent required, "0" = not required; missing = FAIL-OPEN, i.e. NOT required) and the
+         user's choice cookie (emergent_consent, which carries per-category grants in `cats`).
+         PER-CATEGORY gate: each NON-Google script gates on host allowed AND its category's grant —
+           __emergentAdvertisingAllowed (Meta/TikTok/Rewardful),
+           __emergentAnalyticsAllowed (VWO). These stay fully blocked until consent.
+         PartnerStack is the exception: disclosed as ESSENTIAL (partner referral attribution), so it
+         boots on __emergentHostAllowed alone and no category grant gates it.
+         GOOGLE tags (Consent Mode v2 BASIC / opt-in) also load only AFTER consent — withheld entirely
+         until the relevant category is granted: GTM gates on __emergentGoogleTagsAllowed (host AND
+         advertising consent) and the Wingman GA4 gtag on __wingmanGoogleTagsAllowed (host AND analytics
+         consent). Consent Mode signals (default-denied -> per-category granted) below still govern
+         storage once a tag loads. __emergentTrackingAllowed is kept as the coarse host AND (advertising
+         OR analytics) signal for the gtmService dataLayer funnel.
+         PRECEDENCE: an explicit stored choice OUTRANKS the verdict and is honoured in every region.
+         Only a visitor with NO stored choice falls back to the verdict, so verdict "0" + no choice
+         (the 99% rest-of-world case, who never saw a banner) leaves every flag byte-for-byte at
+         today's values and pushes no Consent Mode calls (rest-of-world invariant preserved).
+         Mirrors isCategoryAllowed/getConsentCategories in src/lib/consent/consent.ts — keep the
+         readers in sync. -->
+    <script>
+      (function () {
+        function escapeForRegExp(s) {
+          return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        }
+        function readCookie(name) {
+          try {
+            var match = document.cookie.match(new RegExp("(^|;\\s*)" + escapeForRegExp(name) + "=([^;]*)"));
+            return match ? match[2] : null;
+          } catch (e) {
+            // document.cookie can throw (sandboxed iframe / fully blocked storage). Return null so the
+            // gate proceeds on the fail-open default (verdict null -> not required -> trackers allowed),
+            // matching consent.ts. A stored choice is not lost with it: the localStorage mirror read
+            // below still recovers an earlier accept/reject whenever storage itself is readable.
+            console.warn("[consent-gate]", e);
+            return null;
+          }
+        }
+        var verdict = readCookie("emergent_geo_consent");
+        // Dev-only override, gated to localhost so it can never bypass the consent gate on a production
+        // host, and honoured only when the edge cookie is absent/unreadable. (Inline scripts do not get
+        // import.meta.env.DEV substitution, so this mirrors consent.ts's build gate via the hostname.)
+        var isDevHost = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+        if (isDevHost && verdict !== "0" && verdict !== "1") {
+          try {
+            var devVerdict = localStorage.getItem("emergent_consent_dev_verdict");
+            if (devVerdict === "0" || devVerdict === "1") verdict = devVerdict;
+          } catch (e) {
+            console.warn("[consent-gate]", e);
+          }
+        }
+        // Fail-open: only an explicit "1" means consent is required. The edge stamps "0" or "1" on
+        // every response it serves, so a missing/garbled verdict means no edge verdict was applied —
+        // and with no verdict we neither prompt nor gate. Mirrors consent.ts's isConsentRequired;
+        // consentBootstrap.test.ts fails if the two drift.
+        var consentRequired = verdict === "1";
+
+        // Tolerant reader for the choice cookie/mirror: captures both the binary choice (c) and the
+        // per-category grants (cats). Mirrors getConsentRecord/getConsentCategories in src/lib/consent.
+        var choice = null;
+        var cats = null;
+        function ingestConsent(value) {
+          if (!value) return false;
+          var decoded = value;
+          try {
+            decoded = decodeURIComponent(value);
+          } catch (e) {
+            console.warn("[consent-gate]", e);
+          }
+          if (decoded === "accepted" || decoded === "rejected") {
+            choice = decoded;
+            return true;
+          }
+          try {
+            var parsed = JSON.parse(decoded);
+            if (parsed && (parsed.c === "accepted" || parsed.c === "rejected")) {
+              choice = parsed.c;
+              if (parsed.cats && typeof parsed.cats === "object") cats = parsed.cats;
+              return true;
+            }
+          } catch (e) {
+            console.warn("[consent-gate]", e);
+          }
+          return false;
+        }
+        try {
+          if (!ingestConsent(readCookie("emergent_consent"))) {
+            // localStorage mirror fallback (tolerant reader, same as src/lib/consent).
+            try {
+              ingestConsent(localStorage.getItem("emergent_consent"));
+            } catch (e) {
+              console.warn("[consent-gate]", e);
+            }
+          }
+        } catch (e) {
+          console.warn("[consent-gate]", e);
+        }
+
+        // Per-category enforcement (mirrors isCategoryAllowed): an explicit stored choice OUTRANKS the
+        // geo verdict, so a visitor who saved preferences keeps them in EVERY region (travel / VPN off /
+        // an edge verdict flip to "0" can no longer silently re-enable trackers). `cats` governs when
+        // present; a legacy record without `cats` falls back to its binary choice (accepted -> all on).
+        // Only with NO stored choice at all do we fall back to the verdict: rest-of-world (verdict 0)
+        // allows every category, consent-required fails closed.
+        function categoryAllowed(key) {
+          if (cats) return cats[key] === true;
+          if (choice) return choice === "accepted";
+          return !consentRequired;
+        }
+        var advertisingAllowed = categoryAllowed("advertising");
+        var analyticsAllowed = categoryAllowed("analytics");
+
+        window.__emergentConsentRequired = consentRequired;
+        window.__emergentConsentChoice = choice;
+        var hostAllowed = window.__emergentTrackingAllowed;
+        var wingmanHostAllowed = window.__wingmanTrackingAllowed;
+        // Google tags load only AFTER consent (opt-in) — never anonymously before it. The gate keeps the
+        // existing host allowlist and folds the relevant category grant on top (host gating preserved,
+        // never replaced). The GTM container is advertising (Meta/TikTok/Google Ads) -> gate on
+        // advertising; the Wingman GA4 tag -> gate on analytics. categoryAllowed() already folds in the
+        // verdict fallback, so verdict "0" (ROW) with NO stored choice still grants both exactly as
+        // before — but a ROW visitor who stored a choice now has it honoured here too. The raw host
+        // allowlist is exposed so the in-session accept flow can boot the tag the moment consent is
+        // granted (see consentService.reconcileConsentCategories).
+        window.__emergentHostAllowed = hostAllowed;
+        window.__wingmanHostAllowed = wingmanHostAllowed;
+        window.__emergentGoogleTagsAllowed = hostAllowed && advertisingAllowed;
+        window.__wingmanGoogleTagsAllowed = wingmanHostAllowed && analyticsAllowed;
+        // Per-category script gates: host allowlist AND that category's grant. The NON-Google trackers
+        // (Meta/TikTok/Rewardful on advertising; VWO on analytics) have no Consent Mode and stay fully
+        // blocked until consent — these gates are unchanged by Advanced mode. PartnerStack is NOT among
+        // them: it is essential-category and gates on __emergentHostAllowed only.
+        window.__emergentAdvertisingAllowed = hostAllowed && advertisingAllowed;
+        window.__emergentAnalyticsAllowed = hostAllowed && analyticsAllowed;
+        // Coarse consent+host signal — host AND (advertising OR analytics). Mirrors isTrackingAllowed()
+        // in src/lib/consent; retained for category-agnostic callers and the gtmService dataLayer
+        // funnel. It NO LONGER gates the GTM loader (that is __emergentGoogleTagsAllowed above).
+        window.__emergentTrackingAllowed = hostAllowed && (advertisingAllowed || analyticsAllowed);
+        // Coarse wingman consent+host signal — wingman host AND analytics. Retained for category-
+        // agnostic callers; the Wingman GA4 loader now gates on __wingmanGoogleTagsAllowed above.
+        window.__wingmanTrackingAllowed = wingmanHostAllowed && analyticsAllowed;
+
+        // Google Consent Mode for visitors with a STORED CHOICE. The Google tags now load ONLY after a
+        // category is granted (gate flags above), so there is no pre-consent "anonymous" load to hold:
+        // the old default-denied signal plus ads_data_redaction/url_passthrough are gone. When a grant
+        // exists we set the granted per-category state up front so a RETURNING user's tags (which load at
+        // parse) honor partial grants; a fresh in-session grant is handled by consentService. Keyed on
+        // "has a stored choice" rather than the verdict: a ROW visitor with a PARTIAL stored grant must
+        // get the matching denials too, or the tags their grant does load would treat the denied
+        // categories as granted-by-default. Scoped to allowlisted hosts so non-allowlisted hosts keep
+        // window.dataLayer undefined exactly as today; a ROW visitor with NO stored choice still has no
+        // cats/choice, so this sets nothing and keeps full, un-gated behavior byte-for-byte.
+        if ((cats || choice) && (advertisingAllowed || analyticsAllowed) && (hostAllowed || wingmanHostAllowed)) {
+          window.dataLayer = window.dataLayer || [];
+          function gtag() {
+            window.dataLayer.push(arguments);
+          }
+          gtag("consent", "default", {
+            ad_storage: advertisingAllowed ? "granted" : "denied",
+            ad_user_data: advertisingAllowed ? "granted" : "denied",
+            ad_personalization: advertisingAllowed ? "granted" : "denied",
+            analytics_storage: analyticsAllowed ? "granted" : "denied",
+          });
+        }
+      })();
+    </script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- Prevents PKCE `?code=` leaking to third parties via Referer. -->
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <meta name="e1ectron-scorecard-build-sha" content="663e3bfc4d18687eed61fe5648ecc4cd9b06ef46" />
+
+    <!-- DNS Prefetch and Preconnect for external services -->
+    <link rel="dns-prefetch" href="https://assets.emergent.sh" />
+    <link rel="dns-prefetch" href="https://res.cloudinary.com" />
+    <link rel="dns-prefetch" href="https://www.googletagmanager.com" />
+    <link rel="preconnect" href="https://assets.emergent.sh" crossorigin />
+    <link rel="preconnect" href="https://dev.visualwebsiteoptimizer.com" />
+    <link rel="preconnect" href="https://js.stripe.com" />
+    <link rel="preconnect" href="https://analytics.tiktok.com" />
+
+    <!-- Primary Meta Tags -->
+    <title>Emergent</title>
+    <meta name="title" content="Emergent - AI-Powered App Development | No Code Required" />
+    <meta
+      name="description"
+      content="Transform ideas into production-ready applications with AI. Build web apps, mobile platforms, and custom software through simple conversation, no coding required."
+    />
+    <meta
+      name="keywords"
+      content="no-code development, AI app builder, software development, web app creator, mobile app development, AI coding assistant"
+    />
+    <meta name="author" content="Emergent" />
+
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://emergent.sh/" />
+    <meta property="og:title" content="Emergent - AI-Powered App Development | No Code Required" />
+    <meta
+      property="og:description"
+      content="From idea to app in minutes. AI-powered development platform for creators, entrepreneurs, and developers."
+    />
+    <meta property="og:image" content="https://app.emergent.sh/logo.png" />
+    <script>
+      (function () {
+        var h = window.location.hostname;
+        var isWingman = h.includes("getwingman.sh") || h.includes("getwingman.com");
+        var m = document.createElement("meta");
+        m.name = "facebook-domain-verification";
+        m.content = isWingman ? "669ilma0h2dlj0a8ou27f0f0gdq2at" : "v1096rpo7sp3nzp96d9ik3cvgwzodd";
+        document.head.appendChild(m);
+      })();
+    </script>
+
+    <!-- Twitter -->
+    <meta property="twitter:card" content="summary_large_image" />
+    <meta property="twitter:url" content="https://emergent.sh/" />
+    <meta property="twitter:title" content="Emergent - AI-Powered App Development | No Code Required" />
+    <meta
+      property="twitter:description"
+      content="Build real products with Emergent's vibe-coding platform. Emergent AI creates production-ready applications from natural language—no developers required."
+    />
+    <meta property="twitter:image" content="https://app.emergent.sh/twitter-image.jpg" />
+
+    <!-- Favicon -->
+    <link rel="icon" href="/favicon.ico" type="image/x-icon" />
+    <link rel="manifest" href="/site.webmanifest" />
+
+    <!-- Preload cloud background only for light-mode users -->
+    <script>
+      (function () {
+        try {
+          var theme = localStorage.getItem("emergent-theme");
+          if (!theme) {
+            var isLoggedIn = Object.keys(localStorage).some(function (k) {
+              return k.startsWith("sb-") && k.endsWith("-auth-token");
+            });
+            theme = isLoggedIn ? "dark" : "system";
+          }
+          var isLight =
+            theme === "light" || (theme === "system" && window.matchMedia("(prefers-color-scheme: light)").matches);
+          if (isLight) {
+            var link = document.createElement("link");
+            link.rel = "preload";
+            link.as = "image";
+            link.type = "image/webp";
+            link.href = "/backgrounds/light_cloud_bg.webp";
+            document.head.appendChild(link);
+          }
+        } catch (e) {}
+      })();
+    </script>
+
+    <!-- Fonts and Styles - Preconnect for better performance -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&family=Istok+Web:wght@400&family=JetBrains+Mono:ital,wght@0,100..800;1,100..800&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter+Tight:ital,wght@0,100..900;1,100..900&display=swap"
+      rel="stylesheet"
+    />
+    <link href="https://fonts.googleapis.com/css2?family=Nanum+Pen+Script&display=swap" rel="stylesheet" />
+    <!-- Canonical URL -->
+    <link rel="canonical" href="https://emergent.sh/" />
+    <!-- Google Tag Manager (GTM-NCCB99P9) — host allowlist AND advertising consent (see __emergentGoogleTagsAllowed).
+         Withheld entirely until consent, so the container's non-Google tags (Meta/TikTok) can no longer fire
+         before an opt-in. Exposed as an idempotent boot function so an in-session accept boots it without a
+         reload; the guard makes a parse-time load and a grant-time load safe to both run. -->
+    <script>
+      window.__emergentBootGtm = function () {
+        if (window.__emergentGtmBooted) return;
+        window.__emergentGtmBooted = true;
+        (function (w, d, s, l, i) {
+          w[l] = w[l] || [];
+          w[l].push({ "gtm.start": new Date().getTime(), event: "gtm.js" });
+          var f = d.getElementsByTagName(s)[0],
+            j = d.createElement(s),
+            dl = l != "dataLayer" ? "&l=" + l : "";
+          j.async = true;
+          j.src = "https://www.googletagmanager.com/gtm.js?id=" + i + dl;
+          f.parentNode.insertBefore(j, f);
+        })(window, document, "script", "dataLayer", "GTM-NCCB99P9");
+      };
+      if (window.__emergentGoogleTagsAllowed) window.__emergentBootGtm();
+    </script>
+    <!-- Google tag (gtag.js) — Wingman GA4 (G-Y61DH5D90B). Wingman host allowlist AND analytics consent
+         (see __wingmanGoogleTagsAllowed). Withheld until consent; exposed as an idempotent boot function so
+         an in-session accept boots it without a reload. -->
+    <script>
+      window.__emergentBootWingmanGa = function () {
+        if (window.__wingmanGaBooted) return;
+        window.__wingmanGaBooted = true;
+        var s = document.createElement("script");
+        s.async = true;
+        s.src = "https://www.googletagmanager.com/gtag/js?id=G-Y61DH5D90B";
+        document.head.appendChild(s);
+        window.dataLayer = window.dataLayer || [];
+        function gtag() {
+          window.dataLayer.push(arguments);
+        }
+        gtag("js", new Date());
+        gtag("config", "G-Y61DH5D90B");
+      };
+      if (window.__wingmanGoogleTagsAllowed) window.__emergentBootWingmanGa();
+    </script>
+    <!-- Conditionally load Rewardful for affiliate users only (advertising category). Idempotent boot
+         function so an in-session advertising accept loads it without a reload (mirrors __emergentBootMetaPixel). -->
+    <script>
+      window.__emergentBootRewardful = function () {
+        if (window.__emergentRewardfulBooted) return;
+        window.__emergentRewardfulBooted = true;
+        // Helper to get cookie by name
+        function getCookieValue(name) {
+          var match = document.cookie.match(new RegExp("(^| )" + name + "=([^;]+)"));
+          return match ? match[2] : null;
+        }
+
+        // Check if user is from affiliate link
+        function isAffiliateUser() {
+          var urlParams = new URLSearchParams(window.location.search);
+          var affiliateParams = ["via", "referral", "ref", "affiliate", "aff", "affid"];
+
+          // Check URL parameters
+          for (var i = 0; i < affiliateParams.length; i++) {
+            if (urlParams.get(affiliateParams[i])) {
+              // console.log('[Rewardful] ✅ Affiliate param found:', affiliateParams[i]);
+              return true;
+            }
+          }
+
+          // Check if rewardful cookie already exists (returning affiliate user)
+          // Use proper cookie parsing to avoid false positives from other cookies containing the string
+          var rewardfulReferral = getCookieValue("rewardful.referral");
+          var rewardfulAffiliate = getCookieValue("rewardful_affiliate");
+          var viaCookie = getCookieValue("via");
+
+          if (rewardfulReferral || rewardfulAffiliate || viaCookie) {
+            // console.log('[Rewardful] ✅ Returning affiliate user (cookie found)');
+            return true;
+          }
+
+          // console.log('[Rewardful] ⛔ Organic user - skipping Rewardful');
+          return false;
+        }
+
+        // Only load Rewardful for affiliate users
+        if (isAffiliateUser()) {
+          // console.log('[Rewardful] 🎯 Loading Rewardful script');
+
+          // Initialize queue
+          (function (w, r) {
+            w._rwq = r;
+            w[r] =
+              w[r] ||
+              function () {
+                (w[r].q = w[r].q || []).push(arguments);
+              };
+          })(window, "rewardful");
+
+          // Load script
+          var script = document.createElement("script");
+          script.src = "https://r.wdfl.co/rw.js";
+          script.async = true;
+          script.setAttribute("data-rewardful", "981168");
+          document.head.appendChild(script);
+        }
+      };
+      if (window.__emergentAdvertisingAllowed) window.__emergentBootRewardful();
+    </script>
+    <!-- Start VWO Async SmartCode -->
+    <script type="text/javascript" id="vwoCode">
+      window._vwo_code ||
+        (function () {
+          if (!window.__emergentAnalyticsAllowed) return;
+          var w = window,
+            d = document;
+          var account_id = 1188541,
+            version = 2.2,
+            settings_tolerance = 800,
+            hide_element = "body",
+            hide_element_style = "opacity:0 !important;filter:alpha(opacity=0) !important;background:none !important",
+            f = 0;
+          /* DO NOT EDIT BELOW THIS LINE */
+          if (
+            ((f = !1),
+            (v = d.querySelector("#vwoCode")),
+            (cc = {}),
+            -1 < d.URL.indexOf("__vwo_disable__") || w._vwo_code)
+          )
+            return;
+          try {
+            var e = JSON.parse(localStorage.getItem("_vwo_" + account_id + "_config"));
+            cc = e && "object" == typeof e ? e : {};
+          } catch (e) {}
+          function r(t) {
+            try {
+              return decodeURIComponent(t);
+            } catch (e) {
+              return t;
+            }
+          }
+          var s = (function () {
+            var e = {
+                combination: [],
+                combinationChoose: [],
+                split: [],
+                exclude: [],
+                uuid: null,
+                consent: null,
+                optOut: null,
+              },
+              t = d.cookie || "";
+            if (!t) return e;
+            for (
+              var n,
+                i,
+                o =
+                  /(?:^|;\s*)(?:(_vis_opt_exp_(\d+)_combi=([^;]*))|(_vis_opt_exp_(\d+)_combi_choose=([^;]*))|(_vis_opt_exp_(\d+)_split=([^:;]*))|(_vis_opt_exp_(\d+)_exclude=[^;]*)|(_vis_opt_out=([^;]*))|(_vwo_global_opt_out=[^;]*)|(_vwo_uuid=([^;]*))|(_vwo_consent=([^;]*)))/g;
+              null !== (n = o.exec(t));
+            )
+              try {
+                n[1]
+                  ? e.combination.push({ id: n[2], value: r(n[3]) })
+                  : n[4]
+                    ? e.combinationChoose.push({ id: n[5], value: r(n[6]) })
+                    : n[7]
+                      ? e.split.push({ id: n[8], value: r(n[9]) })
+                      : n[10]
+                        ? e.exclude.push({ id: n[11] })
+                        : n[12]
+                          ? (e.optOut = r(n[13]))
+                          : n[14]
+                            ? (e.optOut = !0)
+                            : n[15]
+                              ? (e.uuid = r(n[16]))
+                              : n[17] && ((i = r(n[18])), (e.consent = i && 3 <= i.length ? i.substring(0, 3) : null));
+              } catch (e) {}
+            return e;
+          })();
+          function i() {
+            var e = (function () {
+                if (w.VWO && Array.isArray(w.VWO))
+                  for (var e = 0; e < w.VWO.length; e++) {
+                    var t = w.VWO[e];
+                    if (Array.isArray(t) && ("setVisitorId" === t[0] || "setSessionId" === t[0])) return !0;
+                  }
+                return !1;
+              })(),
+              t =
+                "a=" +
+                account_id +
+                "&u=" +
+                encodeURIComponent(w._vis_opt_url || d.URL) +
+                "&vn=" +
+                version +
+                "&ph=1" +
+                ("undefined" != typeof platform ? "&p=" + platform : "") +
+                "&st=" +
+                w.performance.now();
+            (e ||
+              ((n = (function () {
+                var e,
+                  t = [],
+                  n = {},
+                  i = (w.VWO && w.VWO.appliedCampaigns) || {};
+                for (e in i) {
+                  var o = i[e] && i[e].v;
+                  o && (t.push(e + "-" + o + "-1"), (n[e] = !0));
+                }
+                if (s && s.combination)
+                  for (var r = 0; r < s.combination.length; r++) {
+                    var a = s.combination[r];
+                    n[a.id] || t.push(a.id + "-" + a.value);
+                  }
+                return t.join("|");
+              })()) && (t += "&c=" + n),
+              (n = (function () {
+                var e = [],
+                  t = {};
+                if (s && s.combinationChoose)
+                  for (var n = 0; n < s.combinationChoose.length; n++) {
+                    var i = s.combinationChoose[n];
+                    (e.push(i.id + "-" + i.value), (t[i.id] = !0));
+                  }
+                if (s && s.split)
+                  for (var o = 0; o < s.split.length; o++) t[(i = s.split[o]).id] || e.push(i.id + "-" + i.value);
+                return e.join("|");
+              })()) && (t += "&cc=" + n),
+              (n = (function () {
+                var e = {},
+                  t = [];
+                if (w.VWO && Array.isArray(w.VWO))
+                  for (var n = 0; n < w.VWO.length; n++) {
+                    var i = w.VWO[n];
+                    if (Array.isArray(i) && "setVariation" === i[0] && i[1] && Array.isArray(i[1]))
+                      for (var o = 0; o < i[1].length; o++) {
+                        var r,
+                          a = i[1][o];
+                        a && "object" == typeof a && ((r = a.e), (a = a.v), r && a && (e[r] = a));
+                      }
+                  }
+                for (r in e) t.push(r + "-" + e[r]);
+                return t.join("|");
+              })()) && (t += "&sv=" + n)),
+              s && s.optOut && (t += "&o=" + s.optOut));
+            var n = (function () {
+              var e = [],
+                t = {};
+              if (s && s.exclude)
+                for (var n = 0; n < s.exclude.length; n++) {
+                  var i = s.exclude[n];
+                  t[i.id] || (e.push(i.id), (t[i.id] = !0));
+                }
+              return e.join("|");
+            })();
+            return (
+              n && (t += "&e=" + n),
+              s && s.uuid && (t += "&id=" + s.uuid),
+              s && s.consent && (t += "&consent=" + s.consent),
+              w.name && -1 < w.name.indexOf("_vis_preview") && (t += "&pM=true"),
+              w.VWO && w.VWO.ed && (t += "&ed=" + w.VWO.ed),
+              t
+            );
+          }
+          code = {
+            nonce: v && v.nonce,
+            library_tolerance: function () {
+              return "undefined" != typeof library_tolerance ? library_tolerance : void 0;
+            },
+            settings_tolerance: function () {
+              return cc.sT || settings_tolerance;
+            },
+            hide_element_style: function () {
+              return "{" + (cc.hES || hide_element_style) + "}";
+            },
+            hide_element: function () {
+              return performance.getEntriesByName("first-contentful-paint")[0]
+                ? ""
+                : "string" == typeof cc.hE
+                  ? cc.hE
+                  : hide_element;
+            },
+            getVersion: function () {
+              return version;
+            },
+            finish: function (e) {
+              var t;
+              f ||
+                ((f = !0),
+                (t = d.getElementById("_vis_opt_path_hides")) && t.parentNode.removeChild(t),
+                e && (new Image().src = "https://dev.visualwebsiteoptimizer.com/ee.gif?a=" + account_id + e));
+            },
+            finished: function () {
+              return f;
+            },
+            addScript: function (e) {
+              var t = d.createElement("script");
+              ((t.type = "text/javascript"),
+                e.src ? (t.src = e.src) : (t.text = e.text),
+                v && t.setAttribute("nonce", v.nonce),
+                d.getElementsByTagName("head")[0].appendChild(t));
+            },
+            load: function (e, t) {
+              t = t || {};
+              var n = new XMLHttpRequest();
+              (n.open("GET", e, !0),
+                (n.withCredentials = !t.dSC),
+                (n.responseType = t.responseType || "text"),
+                (n.onload = function () {
+                  if (t.onloadCb) return t.onloadCb(n, e);
+                  200 === n.status
+                    ? _vwo_code.addScript({ text: n.responseText })
+                    : _vwo_code.finish("&e=loading_failure:" + e);
+                }),
+                (n.onerror = function () {
+                  if (t.onerrorCb) return t.onerrorCb(e);
+                  _vwo_code.finish("&e=loading_failure:" + e);
+                }),
+                n.send());
+            },
+            init: function () {
+              var e,
+                t = this.settings_tolerance();
+              ((w._vwo_settings_timer = setTimeout(function () {
+                _vwo_code.finish();
+              }, t)),
+                "body" !== this.hide_element()
+                  ? ((n = d.createElement("style")),
+                    (e = (t = this.hide_element()) ? t + this.hide_element_style() : ""),
+                    (t = d.getElementsByTagName("head")[0]),
+                    n.setAttribute("id", "_vis_opt_path_hides"),
+                    v && n.setAttribute("nonce", v.nonce),
+                    n.setAttribute("type", "text/css"),
+                    n.styleSheet ? (n.styleSheet.cssText = e) : n.appendChild(d.createTextNode(e)),
+                    t.appendChild(n))
+                  : ((n = d.getElementsByTagName("head")[0]),
+                    ((e = d.createElement("div")).style.cssText =
+                      "z-index: 2147483647 !important;position: fixed !important;left: 0 !important;top: 0 !important;width: 100% !important;height: 100% !important;background: white !important;"),
+                    e.setAttribute("id", "_vis_opt_path_hides"),
+                    e.classList.add("_vis_hide_layer"),
+                    n.parentNode.insertBefore(e, n.nextSibling)));
+              var n = "https://dev.visualwebsiteoptimizer.com/j.php?" + i();
+              -1 !== w.location.search.indexOf("_vwo_xhr")
+                ? this.addScript({ src: n })
+                : this.load(n + "&x=true", { l: 1 });
+            },
+          };
+          w._vwo_code = code;
+          code.init();
+        })();
+    </script>
+    <!-- End VWO Async SmartCode -->
+    <!-- Add Google Identity Services script -->
+    <script src="https://accounts.google.com/gsi/client" async></script>
+    <!-- Paddle.js for checkout overlay (initialized in paddleService.ts with env token) -->
+    <script src="https://cdn.paddle.com/paddle/v2/paddle.js" defer></script>
+    <!-- Meta Pixel Code — advertising category. Withheld until consent; exposed as an idempotent boot
+         function so an in-session advertising accept boots it without a reload (mirrors __emergentBootGtm).
+         The __emergentMetaPixelBooted guard makes a parse-time load and a grant-time load safe to both run. -->
+    <script>
+      window.__emergentBootMetaPixel = function () {
+        if (window.__emergentMetaPixelBooted) return;
+        window.__emergentMetaPixelBooted = true;
+        !(function (f, b, e, v, n, t, s) {
+          if (f.fbq) return;
+          n = f.fbq = function () {
+            n.callMethod ? n.callMethod.apply(n, arguments) : n.queue.push(arguments);
+          };
+          if (!f._fbq) f._fbq = n;
+          n.push = n;
+          n.loaded = !0;
+          n.version = "2.0";
+          n.queue = [];
+          t = b.createElement(e);
+          t.async = !0;
+          t.src = v;
+          s = b.getElementsByTagName(e)[0];
+          s.parentNode.insertBefore(t, s);
+        })(window, document, "script", "https://connect.facebook.net/en_US/fbevents.js");
+        fbq("init", "1326372205570201");
+        fbq("track", "PageView");
+      };
+      if (window.__emergentAdvertisingAllowed) window.__emergentBootMetaPixel();
+    </script>
+    <!-- End Meta Pixel Code -->
+    <!-- TikTok Pixel Code — advertising category. Withheld until consent; exposed as an idempotent boot
+         function so an in-session advertising accept boots it without a reload (mirrors __emergentBootGtm). -->
+    <script>
+      window.__emergentBootTikTokPixel = function () {
+        if (window.__emergentTikTokPixelBooted) return;
+        window.__emergentTikTokPixelBooted = true;
+        (function (w, d, t) {
+          w.TiktokAnalyticsObject = t;
+          var ttq = (w[t] = w[t] || []);
+          ttq.methods = [
+            "page",
+            "track",
+            "identify",
+            "instances",
+            "debug",
+            "on",
+            "off",
+            "once",
+            "ready",
+            "alias",
+            "group",
+            "enableCookie",
+            "disableCookie",
+            "holdConsent",
+            "revokeConsent",
+            "grantConsent",
+          ];
+          ttq.setAndDefer = function (queue, method) {
+            queue[method] = function () {
+              queue.push([method].concat(Array.prototype.slice.call(arguments, 0)));
+            };
+          };
+          for (var i = 0; i < ttq.methods.length; i++) {
+            ttq.setAndDefer(ttq, ttq.methods[i]);
+          }
+          ttq.instance = function (pixelId) {
+            ttq._i = ttq._i || {};
+            var instance = ttq._i[pixelId] || [];
+            for (var j = 0; j < ttq.methods.length; j++) {
+              ttq.setAndDefer(instance, ttq.methods[j]);
+            }
+            return instance;
+          };
+          ttq.load = function (pixelId, options) {
+            var source = "https://analytics.tiktok.com/i18n/pixel/events.js";
+            ttq._i = ttq._i || {};
+            ttq._i[pixelId] = [];
+            ttq._i[pixelId]._u = source;
+            ttq._t = ttq._t || {};
+            ttq._t[pixelId] = +new Date();
+            ttq._o = ttq._o || {};
+            ttq._o[pixelId] = options || {};
+            var script = d.createElement("script");
+            script.type = "text/javascript";
+            script.async = true;
+            script.src = source + "?sdkid=" + pixelId + "&lib=" + t;
+            var firstScript = d.getElementsByTagName("script")[0];
+            firstScript.parentNode.insertBefore(script, firstScript);
+          };
+
+          var configuredPixelId = "D8LPE6JC77UDGOQM9GI0";
+          if (!configuredPixelId || configuredPixelId.indexOf("%") === 0) {
+            console.warn("[tiktokPixel] VITE_TIKTOK_PIXEL_ID is not configured");
+            return;
+          }
+          ttq.load(configuredPixelId);
+          ttq.page();
+        })(window, document, "ttq");
+      };
+      if (window.__emergentAdvertisingAllowed) window.__emergentBootTikTokPixel();
+    </script>
+    <!-- End TikTok Pixel Code -->
+    <!-- Conditionally load PartnerStack for partner users only. ESSENTIAL category (partner referral
+         attribution is what makes a partner's own referral link work), so this boots on the host
+         allowlist alone and is NOT gated on the advertising grant. Still host-gated, to keep the
+         third-party script off preview/CDN hosts. Idempotent boot function retained so the loader
+         stays safe to call more than once. -->
+    <script>
+      window.__emergentBootPartnerStack = function () {
+        if (window.__emergentPartnerStackBooted) return;
+        // Helper to get cookie by name (reuse pattern from Rewardful)
+        function getCookieValue(name) {
+          var match = document.cookie.match(new RegExp("(^| )" + name + "=([^;]+)"));
+          return match ? match[2] : null;
+        }
+
+        // Check if user is from partner link
+        function isPartnerUser() {
+          var urlParams = new URLSearchParams(window.location.search);
+
+          if (urlParams.get("ps_partner_key")) {
+            return true;
+          }
+          // Check if ps_partner_key cookie exists (returning partner user)
+          if (getCookieValue("ps_partner_key")) {
+            return true;
+          }
+          return false;
+        }
+
+        // Only load PartnerStack for partner users. The one-shot latch is set HERE, not at the top of
+        // the function: a non-partner visitor must not burn the latch, or a partner key arriving later
+        // in the same page session could never boot the script. (Previously the advertising grant was
+        // a second chance to call this; now that it boots at parse on the host gate alone, that second
+        // chance is gone, so the latch must only fire when the script is actually injected.)
+        if (isPartnerUser()) {
+          window.__emergentPartnerStackBooted = true;
+          var gs = document.createElement("script");
+          gs.src = "https://js.partnerstack.com/v1/";
+          gs.type = "text/javascript";
+          gs.async = true;
+          gs.onload = gs.onreadystatechange = function () {
+            var rs = this.readyState;
+            if (rs && rs != "complete" && rs != "loaded") return;
+            try {
+              growsumo._initialize("pk_X807fuc0nfNQX8tFKDm3PatW0ZZNyDUd", [
+                "emergentlabsinc.partnerlinks.io",
+                "get.emergent.sh",
+                "trialcoig7l2s8gsenk14emergent.partnerlinks.io",
+              ]);
+              if (typeof growsumoInit === "function") {
+                growsumoInit();
+              }
+            } catch (e) {}
+          };
+          var s = document.getElementsByTagName("script")[0];
+          s.parentNode.insertBefore(gs, s);
+        }
+      };
+      if (window.__emergentHostAllowed) window.__emergentBootPartnerStack();
+    </script>
+    <!-- End PartnerStack -->
+    <script type="module" crossorigin src="/main-LyXhD1e0.js"></script>
+    <link rel="modulepreload" crossorigin href="/chunks/chunk-CY1ylONl.js">
+    <link rel="modulepreload" crossorigin href="/chunks/chunk-f-NnfC9p.js">
+    <link rel="modulepreload" crossorigin href="/chunks/chunk-DX4ZIefg.js">
+    <link rel="modulepreload" crossorigin href="/chunks/chunk-KWcdNBLn.js">
+    <link rel="modulepreload" crossorigin href="/chunks/chunk-C8k2ZLFp.js">
+    <link rel="modulepreload" crossorigin href="/chunks/chunk-CCmSeHyw.js">
+    <link rel="modulepreload" crossorigin href="/chunks/index.mjs-cirehduK.js">
+    <link rel="modulepreload" crossorigin href="/chunks/chunk-DOErl27X.js">
+    <link rel="modulepreload" crossorigin href="/chunks/chunk-dUsthhUP.js">
+    <link rel="modulepreload" crossorigin href="/chunks/index.mjs-DMZFUa7S.js">
+    <link rel="stylesheet" crossorigin href="/assets/monaco-editor-BetWCQm5.css">
+    <link rel="stylesheet" crossorigin href="/assets/main-D_wFEKEH.css">
+    <meta name="emergent-build-commit" content="663e3bfc4d18687eed61fe5648ecc4cd9b06ef46">
+    <meta name="emergent-build-time" content="2026-09-02T13:04:55.178Z">
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- No GTM/Meta <noscript> iframes: they load before any JS, so the consent gate cannot reach them. -->
+  <script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a34ce4d78c65a32b',t:'MTc4ODM1NjA4NA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>
